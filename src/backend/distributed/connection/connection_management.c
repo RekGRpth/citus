@@ -9,11 +9,7 @@
  */
 
 #include "postgres.h"
-
-#ifdef HAVE_POLL_H
-#include <poll.h>
-#endif
-
+#include "pgstat.h"
 
 #include "libpq-fe.h"
 
@@ -23,6 +19,7 @@
 #include "commands/dbcommands.h"
 #include "distributed/connection_management.h"
 #include "distributed/errormessage.h"
+#include "distributed/memutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/placement_connection.h"
@@ -46,6 +43,29 @@ static void AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isC
 static void DefaultCitusNoticeProcessor(void *arg, const char *message);
 static MultiConnection * FindAvailableConnection(dlist_head *connections, uint32 flags);
 static bool RemoteTransactionIdle(MultiConnection *connection);
+
+/* types for async connection management */
+typedef struct MultiConnectionState
+{
+	MultiConnection *connection;
+	bool ready;
+	PostgresPollingStatusType pollmode;
+} MultiConnectionState;
+
+
+/* helper functions for async connection management */
+enum EventSetResult
+{
+	Rebuild, Update, None
+};
+static enum EventSetResult MultiConnectionStatePoll(
+	MultiConnectionState *connectionState);
+static WaitEventSet * WaitEventSetFromMultiConnectionStates(List *connections,
+															int *waitCount);
+static int DeadlineTimestampTzToTimeout(TimestampTz deadline);
+static bool CheckMultiConnectionStateTimeouts(List *connections);
+static void CloseNotReadyMultiConnectionStates(List *connections);
+static uint32 MultiConnectionStateEventMask(MultiConnectionState *connectionState);
 
 
 static int CitusNoticeLogLevel = DEFAULT_CITUS_NOTICE_LEVEL;
@@ -437,6 +457,156 @@ ShutdownConnection(MultiConnection *connection)
 }
 
 
+static enum EventSetResult
+MultiConnectionStatePoll(MultiConnectionState *connectionState)
+{
+	MultiConnection *connection = connectionState->connection;
+	ConnStatusType status = PQstatus(connection->pgConn);
+	PostgresPollingStatusType oldPollmode = connectionState->pollmode;
+
+	Assert(!connectionState->ready);
+
+	if (status == CONNECTION_OK)
+	{
+		connectionState->ready = true;
+		return Rebuild;
+	}
+	else if (status == CONNECTION_BAD)
+	{
+		/* FIXME: retries? */
+		connectionState->ready = true;
+		return Rebuild;
+	}
+	else
+	{
+		connectionState->ready = false;
+	}
+
+	connectionState->pollmode = PQconnectPoll(connection->pgConn);
+
+	/*
+	 * FIXME: Do we want to add transparent retry support here?
+	 */
+	if (connectionState->pollmode == PGRES_POLLING_FAILED)
+	{
+		connectionState->ready = true;
+		return Rebuild;
+	}
+	else if (connectionState->pollmode == PGRES_POLLING_OK)
+	{
+		connectionState->ready = true;
+		return Rebuild;
+	}
+	else
+	{
+		Assert(connectionState->pollmode == PGRES_POLLING_WRITING ||
+			   connectionState->pollmode == PGRES_POLLING_READING);
+	}
+
+	return (oldPollmode != connectionState->pollmode) ? Update : None;
+}
+
+
+/*
+ *
+ * waitCount populates the number of connections waiting for in case of a non NULL pointer is provided
+ */
+static WaitEventSet *
+WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
+{
+	WaitEventSet *waitEventSet = NULL;
+	ListCell *connectionCell = NULL;
+
+	/*
+	 * maxEvents is the value min(numConnections, FD_SETSIZE - 3), this is to not add more
+	 * wait events then the set can hold. -3 is used to have room for the following events
+	 * outside of the sockets:
+	 *  - WL_POSTMASTER_DEATH
+	 *  - WL_LATCH_SET
+	 *  - pgwin32_signal_event
+	 *
+	 *  During the loop events are added as long as maxEvents does not reach 0
+	 */
+	int maxEvents = Min(list_length(connections), FD_SETSIZE - 3);
+
+	if (waitCount)
+	{
+		*waitCount = 0;
+	}
+
+	/* allocate pending connections + 2 for the signal latch and postmaster death */
+	/* (CreateWaitEventSet makes room for pgwin32_signal_event automatically) */
+	waitEventSet = CreateWaitEventSet(CurrentMemoryContext, maxEvents + 2);
+	EnsureReleaseResource((MemoryContextCallbackFunction) (&FreeWaitEventSet),
+						  waitEventSet);
+
+	/*
+	 * Put the wait events for the signal latch and postmaster death at the end such that
+	 * event index + pendingConnectionsStartIndex = the connection index in the array.
+	 */
+	AddWaitEventToSet(waitEventSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET, NULL, NULL);
+	AddWaitEventToSet(waitEventSet, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+
+	foreach(connectionCell, connections)
+	{
+		MultiConnectionState *connectionState = (MultiConnectionState *) lfirst(
+			connectionCell);
+		int socket = 0;
+		int eventMask = 0;
+
+		if (maxEvents == 0)
+		{
+			/* room for events to schedule is exhausted */
+			break;
+		}
+
+		if (connectionState->ready)
+		{
+			/* connections that are ready will not be added to the WaitSet */
+			continue;
+		}
+
+		socket = PQsocket(connectionState->connection->pgConn);
+
+		eventMask = MultiConnectionStateEventMask(connectionState);
+
+		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL, connectionState);
+
+		/* increment the waitCount if non NULL */
+		if (waitCount)
+		{
+			*waitCount = *waitCount + 1;
+		}
+
+		/* keep the maxEvents up to date with how many we can still add */
+		maxEvents--;
+	}
+
+	return waitEventSet;
+}
+
+
+/*
+ * MultiConnectionStateEventMask returns the eventMask use by the WaitEventSet for the
+ * for the socket associated with the connection based on the pollmode PQconnectPoll
+ * returned in its last invocation
+ */
+static uint32
+MultiConnectionStateEventMask(MultiConnectionState *connectionState)
+{
+	uint32 eventMask = 0;
+	if (connectionState->pollmode == PGRES_POLLING_READING)
+	{
+		eventMask |= WL_SOCKET_READABLE;
+	}
+	else
+	{
+		eventMask |= WL_SOCKET_WRITEABLE;
+	}
+	return eventMask;
+}
+
+
 /*
  * FinishConnectionListEstablishment is a wrapper around FinishConnectionEstablishment.
  * The function iterates over the multiConnectionList and finishes the connection
@@ -445,176 +615,220 @@ ShutdownConnection(MultiConnection *connection)
 void
 FinishConnectionListEstablishment(List *multiConnectionList)
 {
+	TimestampTz deadline = 0;
+	List *connectionStates = NULL;
 	ListCell *multiConnectionCell = NULL;
+
+	WaitEventSet *waitEventSet = NULL;
+	bool waitEventSetRebuild = true;
+	int waitCount = 0;
+	WaitEvent *events = NULL;
+	MemoryContext oldContext = NULL;
 
 	foreach(multiConnectionCell, multiConnectionList)
 	{
-		MultiConnection *multiConnection = (MultiConnection *) lfirst(
-			multiConnectionCell);
+		MultiConnection *connection = (MultiConnection *) lfirst(multiConnectionCell);
+		MultiConnectionState *connectionState = palloc0(sizeof(MultiConnectionState));
 
-		/* TODO: consider making connection establishment fully in parallel */
-		FinishConnectionEstablishment(multiConnection);
+		TimestampTz connectionDeadline = TimestampTzPlusMilliseconds(
+			connection->connectionStart, NodeConnectionTimeout);
+		if (connectionDeadline > deadline)
+		{
+			deadline = connectionDeadline;
+		}
+
+		connectionState->connection = connection;
+
+		/*
+		 * before we can build the waitset to wait for asynchronous IO we need to know the
+		 * pollmode to use for the sockets. This is populated by executing one round of
+		 * PQconnectPoll. This updates the MultiConnectionState struct with the ready state
+		 * and its next poll mode.
+		 */
+		MultiConnectionStatePoll(connectionState);
+
+		connectionStates = lappend(connectionStates, connectionState);
+		if (!connectionState->ready)
+		{
+			waitCount++;
+		}
 	}
+
+	/* prepapre space for socket events */
+	events = (WaitEvent *) palloc0(Min(list_length(connectionStates), FD_SETSIZE) *
+								   sizeof(WaitEvent));
+
+	/*
+	 * for high connection counts with lots of round trips we could potentially have a lot
+	 * of (big) waitsets that we'd like to clean right after we have used them. To do this
+	 * we switch to a temporary memory context for this loop which gets reset at the end
+	 */
+	oldContext = MemoryContextSwitchTo(
+		AllocSetContextCreate(CurrentMemoryContext,
+							  "connection establishment temporary context",
+							  ALLOCSET_DEFAULT_SIZES));
+	while (waitCount > 0)
+	{
+		long timeout = DeadlineTimestampTzToTimeout(deadline);
+		int eventCount = 0;
+		int eventIndex = 0;
+
+		if (waitEventSetRebuild)
+		{
+			MemoryContextReset(CurrentMemoryContext);
+			waitEventSet = WaitEventSetFromMultiConnectionStates(connectionStates,
+																 &waitCount);
+			waitEventSetRebuild = false;
+
+			if (waitCount <= 0)
+			{
+				break;
+			}
+		}
+
+		eventCount = WaitEventSetWait(waitEventSet, timeout, events, waitCount,
+									  WAIT_EVENT_CLIENT_READ);
+
+		for (eventIndex = 0; eventIndex < eventCount; eventIndex++)
+		{
+			WaitEvent *event = &events[eventIndex];
+			MultiConnectionState *connectionState =
+				(MultiConnectionState *) event->user_data;
+
+			if (event->events & WL_POSTMASTER_DEATH)
+			{
+				ereport(ERROR, (errmsg("postmaster was shut down, exiting")));
+			}
+
+			if (event->events & WL_LATCH_SET)
+			{
+				ResetLatch(MyLatch);
+
+				CHECK_FOR_INTERRUPTS();
+
+				if (InterruptHoldoffCount > 0 && (QueryCancelPending || ProcDiePending))
+				{
+					/*
+					 * because we can't break from 2 loops easily we need to not forget to
+					 * reset the memory context
+					 */
+					MemoryContextDelete(MemoryContextSwitchTo(oldContext));
+					return;
+				}
+
+				continue;
+			}
+
+			switch (MultiConnectionStatePoll(connectionState))
+			{
+				case Rebuild:
+				{
+					waitEventSetRebuild = true;
+					break;
+				}
+
+				case Update:
+				{
+					uint32 eventMask = MultiConnectionStateEventMask(connectionState);
+					ModifyWaitEvent(waitEventSet, event->pos, eventMask, NULL);
+					break;
+				}
+
+				case None:
+				{
+					break;
+				}
+			}
+		}
+
+		if (eventCount == 0)
+		{
+			/*
+			 * timeout has occured, lets check there is an actual timeout, report if that
+			 * is the case and close all non-connected sockets
+			 */
+
+			bool timeoutOccured = CheckMultiConnectionStateTimeouts(connectionStates);
+			if (timeoutOccured)
+			{
+				ereport(WARNING, (errmsg("could not establish connection after %u ms",
+										 NodeConnectionTimeout)));
+				CloseNotReadyMultiConnectionStates(connectionStates);
+
+				/* we are done waiting for the sockets */
+				break;
+			}
+		}
+	}
+	MemoryContextDelete(MemoryContextSwitchTo(oldContext));
+}
+
+
+static int
+DeadlineTimestampTzToTimeout(TimestampTz deadline)
+{
+	long secs = 0;
+	int msecs = 0;
+	TimestampDifference(GetCurrentTimestamp(), deadline, &secs, &msecs);
+	return secs * 1000 + msecs / 1000;
+}
+
+
+static void
+CloseNotReadyMultiConnectionStates(List *connections)
+{
+	ListCell *connectionCell = NULL;
+	foreach(connectionCell, connections)
+	{
+		MultiConnectionState *connectionState = lfirst(connectionCell);
+		MultiConnection *connection = connectionState->connection;
+		if (connectionState->ready)
+		{
+			continue;
+		}
+
+		/* close connection, otherwise we take up resource on the other side */
+		PQfinish(connection->pgConn);
+		connection->pgConn = NULL;
+	}
+}
+
+
+static bool
+CheckMultiConnectionStateTimeouts(List *connections)
+{
+	ListCell *connectionCell = NULL;
+	TimestampTz now = GetCurrentTimestamp();
+
+	foreach(connectionCell, connections)
+	{
+		MultiConnectionState *connectionState = lfirst(connectionCell);
+		MultiConnection *connection = connectionState->connection;
+
+		if (connectionState->ready)
+		{
+			/* skip the deadline test for connections that are already established */
+			continue;
+		}
+
+		if (TimestampDifferenceExceeds(connection->connectionStart, now,
+									   NodeConnectionTimeout))
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
 /*
  * Synchronously finish connection establishment of an individual connection.
- *
- * TODO: Replace with variant waiting for multiple connections.
  */
 void
 FinishConnectionEstablishment(MultiConnection *connection)
 {
-	static int checkIntervalMS = 200;
-
-	/*
-	 * Loop until connection is established, or failed (possibly just timed
-	 * out).
-	 */
-	while (true)
-	{
-		ConnStatusType status = PQstatus(connection->pgConn);
-		PostgresPollingStatusType pollmode;
-
-		if (status == CONNECTION_OK)
-		{
-			return;
-		}
-
-		/* FIXME: retries? */
-		if (status == CONNECTION_BAD)
-		{
-			return;
-		}
-
-		pollmode = PQconnectPoll(connection->pgConn);
-
-		/*
-		 * FIXME: Do we want to add transparent retry support here?
-		 */
-		if (pollmode == PGRES_POLLING_FAILED)
-		{
-			return;
-		}
-		else if (pollmode == PGRES_POLLING_OK)
-		{
-			return;
-		}
-		else
-		{
-			Assert(pollmode == PGRES_POLLING_WRITING ||
-				   pollmode == PGRES_POLLING_READING);
-		}
-
-		/* Loop, to handle poll() being interrupted by signals (EINTR) */
-		while (true)
-		{
-			int pollResult = 0;
-
-			/* we use poll(2) if available, otherwise select(2) */
-#ifdef HAVE_POLL
-			struct pollfd pollFileDescriptor;
-
-			pollFileDescriptor.fd = PQsocket(connection->pgConn);
-			if (pollmode == PGRES_POLLING_READING)
-			{
-				pollFileDescriptor.events = POLLIN;
-			}
-			else
-			{
-				pollFileDescriptor.events = POLLOUT;
-			}
-			pollFileDescriptor.revents = 0;
-
-			/*
-			 * Only sleep for a limited amount of time, so we can react to
-			 * interrupts in time, even if the platform doesn't interrupt
-			 * poll() after signal arrival.
-			 */
-			pollResult = poll(&pollFileDescriptor, 1, checkIntervalMS);
-#else /* !HAVE_POLL */
-			fd_set readFileDescriptorSet;
-			fd_set writeFileDescriptorSet;
-			fd_set exceptionFileDescriptorSet;
-			int selectTimeoutUS = checkIntervalMS * 1000;
-			struct timeval selectTimeout = { 0, selectTimeoutUS };
-			int selectFileDescriptor = PQsocket(connection->pgConn);
-
-			FD_ZERO(&readFileDescriptorSet);
-			FD_ZERO(&writeFileDescriptorSet);
-			FD_ZERO(&exceptionFileDescriptorSet);
-
-			if (pollmode == PGRES_POLLING_READING)
-			{
-				FD_SET(selectFileDescriptor, &readFileDescriptorSet);
-			}
-			else if (pollmode == PGRES_POLLING_WRITING)
-			{
-				FD_SET(selectFileDescriptor, &writeFileDescriptorSet);
-			}
-
-			pollResult = (select) (selectFileDescriptor + 1, &readFileDescriptorSet,
-								   &writeFileDescriptorSet, &exceptionFileDescriptorSet,
-								   &selectTimeout);
-#endif /* HAVE_POLL */
-
-			if (pollResult == 0)
-			{
-				/*
-				 * Timeout exceeded. Two things to do:
-				 * - check whether any interrupts arrived and handle them
-				 * - check whether establishment for connection already has
-				 *   lasted for too long, stop waiting if so.
-				 */
-				CHECK_FOR_INTERRUPTS();
-
-				if (TimestampDifferenceExceeds(connection->connectionStart,
-											   GetCurrentTimestamp(),
-											   NodeConnectionTimeout))
-				{
-					ereport(WARNING, (errmsg("could not establish connection after %u ms",
-											 NodeConnectionTimeout)));
-
-					/* close connection, otherwise we take up resource on the other side */
-					PQfinish(connection->pgConn);
-					connection->pgConn = NULL;
-					break;
-				}
-			}
-			else if (pollResult > 0)
-			{
-				/*
-				 * IO possible, continue connection establishment. We could
-				 * check for timeouts here as well, but if there's progress
-				 * there seems little point.
-				 */
-				break;
-			}
-			else
-			{
-				int errorCode = errno;
-#ifdef WIN32
-				errorCode = WSAGetLastError();
-#endif
-				if (errorCode == EINTR)
-				{
-					/* Retrying, signal interrupted. So check. */
-					CHECK_FOR_INTERRUPTS();
-				}
-				else
-				{
-					/*
-					 * We ERROR here, instead of just returning a failed
-					 * connection, because this shouldn't happen, and indicates a
-					 * programming error somewhere, not a network etc. issue.
-					 */
-					ereport(ERROR, (errcode_for_socket_access(),
-									errmsg("poll()/select() failed: %m")));
-				}
-			}
-		}
-	}
+	FinishConnectionListEstablishment(list_make1(connection));
 }
 
 

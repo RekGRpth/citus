@@ -1,0 +1,56 @@
+--
+-- failure_connection_establishment.sql tests some behaviour of connection management when
+-- it fails to connect.
+--
+-- Failure cases covered:
+--  - timeout
+--
+SELECT citus.mitmproxy('conn.allow()');
+ mitmproxy 
+-----------
+ 
+(1 row)
+
+CREATE SCHEMA fail_connect;
+SET search_path TO 'fail_connect';
+SET citus.shard_count TO 4;
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1450000;
+ALTER SEQUENCE pg_catalog.pg_dist_placement_placementid_seq RESTART 1450000;
+CREATE TABLE products (
+    product_no integer,
+    name text,
+    price numeric
+);
+SELECT create_distributed_table('products', 'product_no');
+ create_distributed_table 
+--------------------------
+ 
+(1 row)
+
+-- Can only add primary key constraint on distribution column (or group of columns
+-- including distribution column)
+-- Command below should error out since 'name' is not a distribution column
+ALTER TABLE products ADD CONSTRAINT p_key PRIMARY KEY(name);
+ERROR:  cannot create constraint on "products"
+DETAIL:  Distributed relations cannot have UNIQUE, EXCLUDE, or PRIMARY KEY constraints that do not include the partition column (with an equality operator if EXCLUDE).
+-- we will insert a connection delay here as this query was the cause for an investigation
+-- into connection establishment problems
+SET citus.node_connection_timeout TO 400;
+SELECT citus.mitmproxy('conn.delay(500)');
+ mitmproxy 
+-----------
+ 
+(1 row)
+
+ALTER TABLE products ADD CONSTRAINT p_key PRIMARY KEY(product_no);
+WARNING:  could not establish connection after 400 ms
+ERROR:  connection error: localhost:9060
+SELECT citus.mitmproxy('conn.allow()');
+ mitmproxy 
+-----------
+ 
+(1 row)
+
+DROP SCHEMA fail_connect CASCADE;
+NOTICE:  drop cascades to table products
+SET search_path TO default;
