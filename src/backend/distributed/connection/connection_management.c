@@ -56,7 +56,9 @@ typedef struct MultiConnectionState
 /* helper functions for async connection management */
 enum EventSetResult
 {
-	Rebuild, Update, None
+	REBUILD,
+	UPDATE,
+	NONE,
 };
 static enum EventSetResult MultiConnectionStatePoll(
 	MultiConnectionState *connectionState);
@@ -469,13 +471,13 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 	if (status == CONNECTION_OK)
 	{
 		connectionState->ready = true;
-		return Rebuild;
+		return REBUILD;
 	}
 	else if (status == CONNECTION_BAD)
 	{
 		/* FIXME: retries? */
 		connectionState->ready = true;
-		return Rebuild;
+		return REBUILD;
 	}
 	else
 	{
@@ -490,12 +492,12 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 	if (connectionState->pollmode == PGRES_POLLING_FAILED)
 	{
 		connectionState->ready = true;
-		return Rebuild;
+		return REBUILD;
 	}
 	else if (connectionState->pollmode == PGRES_POLLING_OK)
 	{
 		connectionState->ready = true;
-		return Rebuild;
+		return REBUILD;
 	}
 	else
 	{
@@ -503,7 +505,7 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 			   connectionState->pollmode == PGRES_POLLING_READING);
 	}
 
-	return (oldPollmode != connectionState->pollmode) ? Update : None;
+	return (oldPollmode != connectionState->pollmode) ? UPDATE : NONE;
 }
 
 
@@ -721,20 +723,20 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 
 			switch (MultiConnectionStatePoll(connectionState))
 			{
-				case Rebuild:
+				case REBUILD:
 				{
 					waitEventSetRebuild = true;
 					break;
 				}
 
-				case Update:
+				case UPDATE:
 				{
 					uint32 eventMask = MultiConnectionStateEventMask(connectionState);
 					ModifyWaitEvent(waitEventSet, event->pos, eventMask, NULL);
 					break;
 				}
 
-				case None:
+				case NONE:
 				{
 					break;
 				}
