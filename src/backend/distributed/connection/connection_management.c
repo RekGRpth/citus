@@ -45,10 +45,16 @@ static MultiConnection * FindAvailableConnection(dlist_head *connections, uint32
 static bool RemoteTransactionIdle(MultiConnection *connection);
 
 /* types for async connection management */
+enum MultiConnectionPhase
+{
+	MULTI_CONNECTION_PHASE_CONNECTING,
+	MULTI_CONNECTION_PHASE_CONNECTED,
+	MULTI_CONNECTION_PHASE_ERROR,
+};
 typedef struct MultiConnectionState
 {
+	enum MultiConnectionPhase phase;
 	MultiConnection *connection;
-	bool ready;
 	PostgresPollingStatusType pollmode;
 } MultiConnectionState;
 
@@ -466,22 +472,22 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 	ConnStatusType status = PQstatus(connection->pgConn);
 	PostgresPollingStatusType oldPollmode = connectionState->pollmode;
 
-	Assert(!connectionState->ready);
+	Assert(connectionState->phase == MULTI_CONNECTION_PHASE_CONNECTING);
 
 	if (status == CONNECTION_OK)
 	{
-		connectionState->ready = true;
+		connectionState->phase = MULTI_CONNECTION_PHASE_CONNECTED;
 		return REBUILD;
 	}
 	else if (status == CONNECTION_BAD)
 	{
 		/* FIXME: retries? */
-		connectionState->ready = true;
+		connectionState->phase = MULTI_CONNECTION_PHASE_ERROR;
 		return REBUILD;
 	}
 	else
 	{
-		connectionState->ready = false;
+		connectionState->phase = MULTI_CONNECTION_PHASE_CONNECTING;
 	}
 
 	connectionState->pollmode = PQconnectPoll(connection->pgConn);
@@ -491,12 +497,12 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 	 */
 	if (connectionState->pollmode == PGRES_POLLING_FAILED)
 	{
-		connectionState->ready = true;
+		connectionState->phase = MULTI_CONNECTION_PHASE_ERROR;
 		return REBUILD;
 	}
 	else if (connectionState->pollmode == PGRES_POLLING_OK)
 	{
-		connectionState->ready = true;
+		connectionState->phase = MULTI_CONNECTION_PHASE_CONNECTED;
 		return REBUILD;
 	}
 	else
@@ -562,9 +568,9 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 			break;
 		}
 
-		if (connectionState->ready)
+		if (connectionState->phase != MULTI_CONNECTION_PHASE_CONNECTING)
 		{
-			/* connections that are ready will not be added to the WaitSet */
+			/* connections that are not connecting will not be added to the WaitSet */
 			continue;
 		}
 
@@ -644,13 +650,13 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 		/*
 		 * before we can build the waitset to wait for asynchronous IO we need to know the
 		 * pollmode to use for the sockets. This is populated by executing one round of
-		 * PQconnectPoll. This updates the MultiConnectionState struct with the ready state
-		 * and its next poll mode.
+		 * PQconnectPoll. This updates the MultiConnectionState struct with its phase and
+		 * its next poll mode.
 		 */
 		MultiConnectionStatePoll(connectionState);
 
 		connectionStates = lappend(connectionStates, connectionState);
-		if (!connectionState->ready)
+		if (connectionState->phase == MULTI_CONNECTION_PHASE_CONNECTING)
 		{
 			waitCount++;
 		}
@@ -784,7 +790,7 @@ CloseNotReadyMultiConnectionStates(List *connections)
 	{
 		MultiConnectionState *connectionState = lfirst(connectionCell);
 		MultiConnection *connection = connectionState->connection;
-		if (connectionState->ready)
+		if (connectionState->phase != MULTI_CONNECTION_PHASE_CONNECTING)
 		{
 			continue;
 		}
@@ -807,9 +813,9 @@ CheckMultiConnectionStateTimeouts(List *connections)
 		MultiConnectionState *connectionState = lfirst(connectionCell);
 		MultiConnection *connection = connectionState->connection;
 
-		if (connectionState->ready)
+		if (connectionState->phase != MULTI_CONNECTION_PHASE_CONNECTING)
 		{
-			/* skip the deadline test for connections that are already established */
+			/* skip the deadline test for connections that are not connecting */
 			continue;
 		}
 
