@@ -526,25 +526,27 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 	ListCell *connectionCell = NULL;
 
 	/*
-	 * maxEvents is the value min(numConnections, FD_SETSIZE - 3), this is to not add more
-	 * wait events then the set can hold. -3 is used to have room for the following events
-	 * outside of the sockets:
+	 * maxEvents is the number of events we can add to the WaitEventSet.
+	 * -3 is used to have room for the following events outside of our connection events
 	 *  - WL_POSTMASTER_DEATH
 	 *  - WL_LATCH_SET
-	 *  - pgwin32_signal_event
-	 *
-	 *  During the loop events are added as long as maxEvents does not reach 0
+	 *  - pgwin32_signal_event (automatically added by CreateWaitEventSet on WIN32)
 	 */
-	int maxEvents = Min(list_length(connections), FD_SETSIZE - 3);
+	const int maxEvents = FD_SETSIZE - 3;
+
+	/*
+	 * eventSetSize is the size we will allocate for the WaitEventSet, we do not create a
+	 * bigger set when we won't need the space; hence the min on connections length
+	 */
+	const int eventSetSize = Min(list_length(connections), maxEvents) + 2;
+	int numEventsAdded = 0;
 
 	if (waitCount)
 	{
 		*waitCount = 0;
 	}
 
-	/* allocate pending connections + 2 for the signal latch and postmaster death */
-	/* (CreateWaitEventSet makes room for pgwin32_signal_event automatically) */
-	waitEventSet = CreateWaitEventSet(CurrentMemoryContext, maxEvents + 2);
+	waitEventSet = CreateWaitEventSet(CurrentMemoryContext, eventSetSize);
 	EnsureReleaseResource((MemoryContextCallbackFunction) (&FreeWaitEventSet),
 						  waitEventSet);
 
@@ -562,7 +564,7 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 		int socket = 0;
 		int eventMask = 0;
 
-		if (maxEvents == 0)
+		if (numEventsAdded >= maxEvents)
 		{
 			/* room for events to schedule is exhausted */
 			break;
@@ -579,15 +581,13 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 		eventMask = MultiConnectionStateEventMask(connectionState);
 
 		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL, connectionState);
+		numEventsAdded++;
 
 		/* increment the waitCount if non NULL */
 		if (waitCount)
 		{
 			*waitCount = *waitCount + 1;
 		}
-
-		/* keep the maxEvents up to date with how many we can still add */
-		maxEvents--;
 	}
 
 	return waitEventSet;
