@@ -70,7 +70,7 @@ static enum EventSetResult MultiConnectionStatePoll(
 	MultiConnectionState *connectionState);
 static WaitEventSet * WaitEventSetFromMultiConnectionStates(List *connections,
 															int *waitCount);
-static int DeadlineTimestampTzToTimeout(TimestampTz deadline);
+static long DeadlineTimestampTzToTimeout(TimestampTz deadline);
 static bool CheckMultiConnectionStateTimeouts(List *connections);
 static void CloseNotReadyMultiConnectionStates(List *connections);
 static uint32 MultiConnectionStateEventMask(MultiConnectionState *connectionState);
@@ -772,7 +772,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 }
 
 
-static int
+static long
 DeadlineTimestampTzToTimeout(TimestampTz deadline)
 {
 	long secs = 0;
