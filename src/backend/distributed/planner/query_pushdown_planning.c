@@ -80,6 +80,7 @@ static bool IsRecurringRangeTable(List *rangeTable, RecurringTuplesType *recurTy
 static bool HasRecurringTuples(Node *node, RecurringTuplesType *recurType);
 static MultiNode * SubqueryPushdownMultiNodeTree(Query *queryTree);
 static List * FlattenJoinVars(List *columnList, Query *queryTree);
+static Node * FlattenSingleJoinVar(Var *column, Query *queryTree);
 static void UpdateVarMappingsForExtendedOpNode(List *columnList,
 											   List *flattenedColumnList,
 											   List *subqueryTargetEntryList);
@@ -1582,51 +1583,80 @@ static List *
 FlattenJoinVars(List *columnList, Query *queryTree)
 {
 	ListCell *columnCell = NULL;
-	List *rteList = queryTree->rtable;
 	List *flattenedExprList = NIL;
 
 	foreach(columnCell, columnList)
 	{
 		Var *column = (Var *) lfirst(columnCell);
-		RangeTblEntry *columnRte = NULL;
-		PlannerInfo *root = NULL;
-
-		Assert(IsA(column, Var));
-
-		/*
-		 * if join does not have an alias, it is copied over join rte.
-		 * There is no need to find the JoinExpr to check whether it has
-		 * an alias defined.
-		 *
-		 * We use the planner's flatten_join_alias_vars routine to do
-		 * the flattening; it wants a PlannerInfo root node, which
-		 * fortunately can be mostly dummy.
-		 */
-		columnRte = rt_fetch(column->varno, rteList);
-		if (columnRte->rtekind == RTE_JOIN && columnRte->alias == NULL)
-		{
-			Node *normalizedNode = NULL;
-
-			if (root == NULL)
-			{
-				root = makeNode(PlannerInfo);
-				root->parse = (queryTree);
-				root->planner_cxt = CurrentMemoryContext;
-				root->hasJoinRTEs = true;
-			}
-
-			normalizedNode = strip_implicit_coercions(flatten_join_alias_vars(root,
-																			  (Node *)
-																			  column));
-			flattenedExprList = lappend(flattenedExprList, copyObject(normalizedNode));
-		}
-		else
-		{
-			flattenedExprList = lappend(flattenedExprList, copyObject(column));
-		}
+		Node *flattenedColumn = FlattenSingleJoinVar(column, queryTree);
+		flattenedExprList = lappend(flattenedExprList, copyObject(flattenedColumn));
 	}
 
 	return flattenedExprList;
+}
+
+
+/*
+ * FlattenSingleJoinVar flattens a single column var as outlined in the caller
+ * function (FlattenJoinVars). It iterates the join tree to find the
+ * lowest Var it can go. This is usually the relation range table var. However
+ * if a join operation is given an alias, iteration stops at that level since the
+ * query can not reference the inner RTE by name if the join is given an alias.
+ *
+ * The function can only work on Vars. It calls postgres' own flatten function
+ * for other types if encountered.
+ *
+ */
+static Node *
+FlattenSingleJoinVar(Var *column, Query *queryTree)
+{
+	RangeTblEntry *rte = rt_fetch(column->varno, queryTree->rtable);
+	Node *newColumn = NULL;
+
+	while (rte->rtekind == RTE_JOIN)
+	{
+		/*
+		 * if join has an alias, it is copied over join RTE. We should
+		 * reference this RTE.
+		 */
+		if (rte->alias != NULL)
+		{
+			return (Node *) column;
+		}
+
+		/* join RTE does not have and alias defined at this level, deper look is needed */
+		Assert(column->varattno > 0);
+		newColumn = (Node *) list_nth(rte->joinaliasvars, column->varattno - 1);
+		Assert(newColumn != NULL);
+
+		/*
+		 * Referenced column from higher RTE is not a Var
+		 * we rely on postgres to do right thing here.
+		 */
+		if (!IsA(newColumn, Var))
+		{
+			Node *normalizedNode = NULL;
+			PlannerInfo *root = makeNode(PlannerInfo);
+			root->parse = (queryTree);
+			root->planner_cxt = CurrentMemoryContext;
+			root->hasJoinRTEs = true;
+
+			normalizedNode = strip_implicit_coercions(
+				flatten_join_alias_vars(root, (Node *) newColumn));
+
+			pfree(root);
+
+			return normalizedNode;
+		}
+
+		Assert(IsA(newColumn, Var));
+
+		/* update the current column var and continue with the non-join rte search */
+		column = (Var *) newColumn;
+		rte = rt_fetch(column->varno, queryTree->rtable);
+	}
+
+	return (Node *) column;
 }
 
 

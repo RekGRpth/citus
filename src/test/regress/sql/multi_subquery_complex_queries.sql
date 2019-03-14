@@ -2428,3 +2428,23 @@ FROM (users_table u FULL JOIN events_table e USING (user_id)) k(x1, x2, x3, x4, 
 ORDER BY 1, 2, 3
 LIMIT 5;
 
+SELECT c_custkey
+FROM  (users_table LEFT OUTER JOIN events_table ON (users_table.user_id = events_table.user_id)) AS test(c_custkey, c_nationkey)
+	INNER JOIN users_table as u2 ON (test.c_custkey = u2.user_id)
+ORDER BY 1 DESC
+LIMIT 10;
+
+SELECT c_custkey, date_trunc('minute', max(c_nationkey))
+FROM  (users_table LEFT OUTER JOIN events_table ON (users_table.user_id = events_table.user_id)) AS test(c_custkey, c_nationkey)
+	INNER JOIN users_table as u2 ON (test.c_custkey = u2.user_id)
+GROUP BY 1
+ORDER BY 2, 1
+LIMIT 10;
+
+SELECT c_custkey, date_trunc('minute', max(c_nationkey))
+FROM  (users_table LEFT OUTER JOIN events_table ON (users_table.user_id = events_table.user_id)) AS test(c_custkey, c_nationkey)
+	INNER JOIN users_table as u2 ON (test.c_custkey = u2.user_id)
+GROUP BY 1
+HAVING extract(minute from max(c_nationkey))  >= 45
+ORDER BY 2, 1
+LIMIT 10;

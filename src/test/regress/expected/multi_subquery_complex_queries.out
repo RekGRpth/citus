@@ -2749,3 +2749,51 @@ LIMIT 5;
   1 |  1 |       2
 (5 rows)
 
+SELECT c_custkey
+FROM  (users_table LEFT OUTER JOIN events_table ON (users_table.user_id = events_table.user_id)) AS test(c_custkey, c_nationkey)
+	INNER JOIN users_table as u2 ON (test.c_custkey = u2.user_id)
+ORDER BY 1 DESC
+LIMIT 10;
+ c_custkey 
+-----------
+         6
+         6
+         6
+         6
+         6
+         6
+         6
+         6
+         6
+         6
+(10 rows)
+
+SELECT c_custkey, date_trunc('minute', max(c_nationkey))
+FROM  (users_table LEFT OUTER JOIN events_table ON (users_table.user_id = events_table.user_id)) AS test(c_custkey, c_nationkey)
+	INNER JOIN users_table as u2 ON (test.c_custkey = u2.user_id)
+GROUP BY 1
+ORDER BY 2, 1
+LIMIT 10;
+ c_custkey |        date_trunc        
+-----------+--------------------------
+         2 | Thu Nov 23 13:52:00 2017
+         6 | Thu Nov 23 14:43:00 2017
+         4 | Thu Nov 23 15:32:00 2017
+         5 | Thu Nov 23 16:48:00 2017
+         3 | Thu Nov 23 17:18:00 2017
+         1 | Thu Nov 23 17:30:00 2017
+(6 rows)
+
+SELECT c_custkey, date_trunc('minute', max(c_nationkey))
+FROM  (users_table LEFT OUTER JOIN events_table ON (users_table.user_id = events_table.user_id)) AS test(c_custkey, c_nationkey)
+	INNER JOIN users_table as u2 ON (test.c_custkey = u2.user_id)
+GROUP BY 1
+HAVING extract(minute from max(c_nationkey))  >= 45
+ORDER BY 2, 1
+LIMIT 10;
+ c_custkey |        date_trunc        
+-----------+--------------------------
+         2 | Thu Nov 23 13:52:00 2017
+         5 | Thu Nov 23 16:48:00 2017
+(2 rows)
+
