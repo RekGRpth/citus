@@ -759,9 +759,9 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 			bool timeoutOccured = CheckMultiConnectionStateTimeouts(connectionStates);
 			if (timeoutOccured)
 			{
-				ereport(WARNING, (errmsg("could not establish connection after %u ms",
-										 NodeConnectionTimeout)));
 				CloseNotReadyMultiConnectionStates(connectionStates);
+				ereport(ERROR, (errmsg("could not establish connection after %u ms",
+									   NodeConnectionTimeout)));
 
 				/* we are done waiting for the sockets */
 				break;
@@ -796,8 +796,7 @@ CloseNotReadyMultiConnectionStates(List *connections)
 		}
 
 		/* close connection, otherwise we take up resource on the other side */
-		PQfinish(connection->pgConn);
-		connection->pgConn = NULL;
+		CloseConnection(connection);
 	}
 }
 
