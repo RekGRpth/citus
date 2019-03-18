@@ -71,7 +71,6 @@ static enum EventSetResult MultiConnectionStatePoll(
 static WaitEventSet * WaitEventSetFromMultiConnectionStates(List *connections,
 															int *waitCount);
 static long DeadlineTimestampTzToTimeout(TimestampTz deadline);
-static bool CheckMultiConnectionStateTimeouts(List *connections);
 static void CloseNotReadyMultiConnectionStates(List *connections);
 static uint32 MultiConnectionStateEventMask(MultiConnectionState *connectionState);
 
@@ -623,7 +622,9 @@ MultiConnectionStateEventMask(MultiConnectionState *connectionState)
 void
 FinishConnectionListEstablishment(List *multiConnectionList)
 {
-	TimestampTz deadline = 0;
+	const TimestampTz connectionStart = GetCurrentTimestamp();
+	const TimestampTz deadline = TimestampTzPlusMilliseconds(connectionStart,
+															 NodeConnectionTimeout);
 	List *connectionStates = NULL;
 	ListCell *multiConnectionCell = NULL;
 
@@ -637,13 +638,6 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 	{
 		MultiConnection *connection = (MultiConnection *) lfirst(multiConnectionCell);
 		MultiConnectionState *connectionState = palloc0(sizeof(MultiConnectionState));
-
-		TimestampTz connectionDeadline = TimestampTzPlusMilliseconds(
-			connection->connectionStart, NodeConnectionTimeout);
-		if (connectionDeadline > deadline)
-		{
-			deadline = connectionDeadline;
-		}
 
 		connectionState->connection = connection;
 
@@ -752,12 +746,12 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 		if (eventCount == 0)
 		{
 			/*
-			 * timeout has occured, lets check there is an actual timeout, report if that
-			 * is the case and close all non-connected sockets
+			 * timeout has occured on waitset, double check the timeout since
+			 * connectionStart and if passed close all non-finished connections
 			 */
 
-			bool timeoutOccured = CheckMultiConnectionStateTimeouts(connectionStates);
-			if (timeoutOccured)
+			TimestampTz now = GetCurrentTimestamp();
+			if (TimestampDifferenceExceeds(connectionStart, now, NodeConnectionTimeout))
 			{
 				CloseNotReadyMultiConnectionStates(connectionStates);
 				ereport(ERROR, (errmsg("could not establish connection after %u ms",
@@ -798,34 +792,6 @@ CloseNotReadyMultiConnectionStates(List *connections)
 		/* close connection, otherwise we take up resource on the other side */
 		CloseConnection(connection);
 	}
-}
-
-
-static bool
-CheckMultiConnectionStateTimeouts(List *connections)
-{
-	ListCell *connectionCell = NULL;
-	TimestampTz now = GetCurrentTimestamp();
-
-	foreach(connectionCell, connections)
-	{
-		MultiConnectionState *connectionState = lfirst(connectionCell);
-		MultiConnection *connection = connectionState->connection;
-
-		if (connectionState->phase != MULTI_CONNECTION_PHASE_CONNECTING)
-		{
-			/* skip the deadline test for connections that are not connecting */
-			continue;
-		}
-
-		if (TimestampDifferenceExceeds(connection->connectionStart, now,
-									   NodeConnectionTimeout))
-		{
-			return true;
-		}
-	}
-
-	return false;
 }
 
 
