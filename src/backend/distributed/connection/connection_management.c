@@ -464,6 +464,12 @@ ShutdownConnection(MultiConnection *connection)
 }
 
 
+/*
+ * MultiConnectionStatePoll executes a PQconnectPoll on the connection to progres the
+ * connection establishment. The return value of this function indicates if the WaitSet
+ * should be updated (when the poll mode changes), rebuilt (when no more polling for this
+ * connections is required) or Nothing (when the pollmode stays the same).
+ */
 static enum EventSetResult
 MultiConnectionStatePoll(MultiConnectionState *connectionState)
 {
@@ -515,8 +521,13 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 
 
 /*
+ * WaitEventSetFromMultiConnectionStates takes a list of MultiConnectionStates and adds
+ * all sockets of the connections that are still in the connecting phase to a WaitSet,
+ * taking into account the maximum number of connections that could be added in total to
+ * a WaitSet.
  *
- * waitCount populates the number of connections waiting for in case of a non NULL pointer is provided
+ * waitCount populates the number of connections added to the WaitSet in case when a
+ * non-NULL pointer is provided.
  */
 static WaitEventSet *
 WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
@@ -766,6 +777,11 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 }
 
 
+/*
+ * DeadlineTimestampTzToTimeout returns the numer of miliseconds that still need to elapse
+ * before the deadline provided as an argument will be reached. The outcome can be used to
+ * pass to the Wait of an EventSet to make sure it returns after the timeout has passed.
+ */
 static long
 DeadlineTimestampTzToTimeout(TimestampTz deadline)
 {
@@ -776,6 +792,14 @@ DeadlineTimestampTzToTimeout(TimestampTz deadline)
 }
 
 
+/*
+ * CloseNotReadyMultiConnectionStates calls CloseConnection for all MultiConnection's
+ * tracked in the MultiConnectionState list passed in, only if the connection is not yet
+ * fully established.
+ *
+ * This function removes the pointer to the MultiConnection data after the Connections are
+ * closed since they should not be used anymore.
+ */
 static void
 CloseNotReadyMultiConnectionStates(List *connections)
 {
@@ -783,20 +807,26 @@ CloseNotReadyMultiConnectionStates(List *connections)
 	foreach(connectionCell, connections)
 	{
 		MultiConnectionState *connectionState = lfirst(connectionCell);
-		MultiConnection *connection = connectionState->connection;
 		if (connectionState->phase != MULTI_CONNECTION_PHASE_CONNECTING)
 		{
 			continue;
 		}
 
 		/* close connection, otherwise we take up resource on the other side */
-		CloseConnection(connection);
+		CloseConnection(connectionState->connection);
+
+		/*
+		 * CloseConnection free's the contents of the MultiConnection struct pointed to.
+		 * To prevent use after free we erase the pointer.
+		 */
+		connectionState->connection = NULL;
 	}
 }
 
 
 /*
  * Synchronously finish connection establishment of an individual connection.
+ * This function is a convenience wrapped around FinishConnectionListEstablishment.
  */
 void
 FinishConnectionEstablishment(MultiConnection *connection)
