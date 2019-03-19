@@ -31,6 +31,19 @@
 #include "utils/memutils.h"
 
 
+/*
+ * WaitEventSets use WaitForMultipleObjects() in windows, which can wait for up to
+ * MAXMIUM_WAIT_OBJECTS events. CreateWaitEventSet() internally uses one
+ * of these slots for pgwin32_signal_event, so we have (MAXMIUM_WAIT_OBJECTS - 1)
+ * slots to use.
+ */
+#ifdef WIN32
+#define MAX_EVENTSET_SIZE (MAXMIUM_WAIT_OBJECTS - 1)
+#else
+#define MAX_EVENTSET_SIZE 1024
+#endif
+
+
 int NodeConnectionTimeout = 5000;
 HTAB *ConnectionHash = NULL;
 HTAB *ConnParamsHash = NULL;
@@ -43,6 +56,7 @@ static void AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isC
 static void DefaultCitusNoticeProcessor(void *arg, const char *message);
 static MultiConnection * FindAvailableConnection(dlist_head *connections, uint32 flags);
 static bool RemoteTransactionIdle(MultiConnection *connection);
+static int eventSetSizeForConnectionList(List *connections);
 
 /* types for async connection management */
 enum MultiConnectionPhase
@@ -521,6 +535,18 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 
 
 /*
+ * eventSetSizeForConnectionList calculates the space needed for a WaitEventSet based on a
+ * list of connections. It takes into account the maximum number of events to wait on and
+ * includes space for the internal signals in postgres.
+ */
+inline static int
+eventSetSizeForConnectionList(List *connections)
+{
+	return Min(list_length(connections) + 2, MAX_EVENTSET_SIZE);
+}
+
+
+/*
  * WaitEventSetFromMultiConnectionStates takes a list of MultiConnectionStates and adds
  * all sockets of the connections that are still in the connecting phase to a WaitSet,
  * taking into account the maximum number of connections that could be added in total to
@@ -536,19 +562,11 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 	ListCell *connectionCell = NULL;
 
 	/*
-	 * maxEvents is the number of events we can add to the WaitEventSet.
-	 * -3 is used to have room for the following events outside of our connection events
-	 *  - WL_POSTMASTER_DEATH
-	 *  - WL_LATCH_SET
-	 *  - pgwin32_signal_event (automatically added by CreateWaitEventSet on WIN32)
-	 */
-	const int maxEvents = FD_SETSIZE - 3;
-
-	/*
 	 * eventSetSize is the size we will allocate for the WaitEventSet, we do not create a
-	 * bigger set when we won't need the space; hence the min on connections length
+	 * bigger set when we won't need the space; hence the min on connections length and
+	 * MAX_EVENTSET_SIZE
 	 */
-	const int eventSetSize = Min(list_length(connections), maxEvents) + 2;
+	const int eventSetSize = eventSetSizeForConnectionList(connections);
 	int numEventsAdded = 0;
 
 	if (waitCount)
@@ -566,6 +584,7 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 	 */
 	AddWaitEventToSet(waitEventSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET, NULL, NULL);
 	AddWaitEventToSet(waitEventSet, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+	numEventsAdded += 2;
 
 	foreach(connectionCell, connections)
 	{
@@ -574,7 +593,7 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 		int socket = 0;
 		int eventMask = 0;
 
-		if (numEventsAdded >= maxEvents)
+		if (numEventsAdded >= eventSetSize)
 		{
 			/* room for events to schedule is exhausted */
 			break;
@@ -593,7 +612,6 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL, connectionState);
 		numEventsAdded++;
 
-		/* increment the waitCount if non NULL */
 		if (waitCount)
 		{
 			*waitCount = *waitCount + 1;
@@ -626,9 +644,9 @@ MultiConnectionStateEventMask(MultiConnectionState *connectionState)
 
 
 /*
- * FinishConnectionListEstablishment is a wrapper around FinishConnectionEstablishment.
- * The function iterates over the multiConnectionList and finishes the connection
- * establishment for each multi connection.
+ * FinishConnectionListEstablishment takes a list of MultiConnection and finishes the
+ * connections establishment asynchronously for all connections not already fully
+ * connected.
  */
 void
 FinishConnectionListEstablishment(List *multiConnectionList)
@@ -667,8 +685,8 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 		}
 	}
 
-	/* prepapre space for socket events */
-	events = (WaitEvent *) palloc0(Min(list_length(connectionStates), FD_SETSIZE) *
+	/* prepare space for socket events */
+	events = (WaitEvent *) palloc0(eventSetSizeForConnectionList(connectionStates) *
 								   sizeof(WaitEvent));
 
 	/*
