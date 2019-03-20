@@ -31,19 +31,6 @@
 #include "utils/memutils.h"
 
 
-/*
- * WaitEventSets use WaitForMultipleObjects() in windows, which can wait for up to
- * MAXMIUM_WAIT_OBJECTS events. CreateWaitEventSet() internally uses one
- * of these slots for pgwin32_signal_event, so we have (MAXMIUM_WAIT_OBJECTS - 1)
- * slots to use.
- */
-#ifdef WIN32
-#define MAX_EVENTSET_SIZE (MAXMIUM_WAIT_OBJECTS - 1)
-#else
-#define MAX_EVENTSET_SIZE 1024
-#endif
-
-
 int NodeConnectionTimeout = 5000;
 HTAB *ConnectionHash = NULL;
 HTAB *ConnParamsHash = NULL;
@@ -536,13 +523,13 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 
 /*
  * eventSetSizeForConnectionList calculates the space needed for a WaitEventSet based on a
- * list of connections. It takes into account the maximum number of events to wait on and
- * includes space for the internal signals in postgres.
+ * list of connections.
  */
 inline static int
 eventSetSizeForConnectionList(List *connections)
 {
-	return Min(list_length(connections) + 2, MAX_EVENTSET_SIZE);
+	/* we need space for 2 postgres events in the waitset on top of the connections */
+	return list_length(connections) + 2;
 }
 
 
@@ -561,11 +548,6 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 	WaitEventSet *waitEventSet = NULL;
 	ListCell *connectionCell = NULL;
 
-	/*
-	 * eventSetSize is the size we will allocate for the WaitEventSet, we do not create a
-	 * bigger set when we won't need the space; hence the min on connections length and
-	 * MAX_EVENTSET_SIZE
-	 */
 	const int eventSetSize = eventSetSizeForConnectionList(connections);
 	int numEventsAdded = 0;
 
