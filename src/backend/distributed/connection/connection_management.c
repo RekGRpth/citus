@@ -76,8 +76,8 @@ typedef struct MultiConnectionState
 /* helper functions for async connection management */
 enum EventSetResult
 {
-	REBUILD,
-	UPDATE,
+	REBUILD_WAITEVENTSET,
+	UPDATE_EVENT_MASK,
 	NONE,
 };
 static enum EventSetResult MultiConnectionStatePoll(
@@ -85,7 +85,7 @@ static enum EventSetResult MultiConnectionStatePoll(
 static WaitEventSet * WaitEventSetFromMultiConnectionStates(List *connections,
 															int *waitCount);
 static long DeadlineTimestampTzToTimeout(TimestampTz deadline);
-static void CloseNotReadyMultiConnectionStates(List *connections);
+static void CloseNotReadyMultiConnectionStates(List *connectionStates);
 static uint32 MultiConnectionStateEventMask(MultiConnectionState *connectionState);
 
 
@@ -496,13 +496,13 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 	if (status == CONNECTION_OK)
 	{
 		connectionState->phase = MULTI_CONNECTION_PHASE_CONNECTED;
-		return REBUILD;
+		return REBUILD_WAITEVENTSET;
 	}
 	else if (status == CONNECTION_BAD)
 	{
 		/* FIXME: retries? */
 		connectionState->phase = MULTI_CONNECTION_PHASE_ERROR;
-		return REBUILD;
+		return REBUILD_WAITEVENTSET;
 	}
 	else
 	{
@@ -517,12 +517,12 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 	if (connectionState->pollmode == PGRES_POLLING_FAILED)
 	{
 		connectionState->phase = MULTI_CONNECTION_PHASE_ERROR;
-		return REBUILD;
+		return REBUILD_WAITEVENTSET;
 	}
 	else if (connectionState->pollmode == PGRES_POLLING_OK)
 	{
 		connectionState->phase = MULTI_CONNECTION_PHASE_CONNECTED;
-		return REBUILD;
+		return REBUILD_WAITEVENTSET;
 	}
 	else
 	{
@@ -530,7 +530,7 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 			   connectionState->pollmode == PGRES_POLLING_READING);
 	}
 
-	return (oldPollmode != connectionState->pollmode) ? UPDATE : NONE;
+	return (oldPollmode != connectionState->pollmode) ? UPDATE_EVENT_MASK : NONE;
 }
 
 
@@ -752,13 +752,13 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 
 			switch (MultiConnectionStatePoll(connectionState))
 			{
-				case REBUILD:
+				case REBUILD_WAITEVENTSET:
 				{
 					waitEventSetRebuild = true;
 					break;
 				}
 
-				case UPDATE:
+				case UPDATE_EVENT_MASK:
 				{
 					uint32 eventMask = MultiConnectionStateEventMask(connectionState);
 					ModifyWaitEvent(waitEventSet, event->pos, eventMask, NULL);
@@ -819,12 +819,12 @@ DeadlineTimestampTzToTimeout(TimestampTz deadline)
  * closed since they should not be used anymore.
  */
 static void
-CloseNotReadyMultiConnectionStates(List *connections)
+CloseNotReadyMultiConnectionStates(List *connectionStates)
 {
-	ListCell *connectionCell = NULL;
-	foreach(connectionCell, connections)
+	ListCell *connectionStateCell = NULL;
+	foreach(connectionStateCell, connectionStates)
 	{
-		MultiConnectionState *connectionState = lfirst(connectionCell);
+		MultiConnectionState *connectionState = lfirst(connectionStateCell);
 		if (connectionState->phase != MULTI_CONNECTION_PHASE_CONNECTING)
 		{
 			continue;
